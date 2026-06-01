@@ -319,16 +319,7 @@ export function Header({
             </span>
           </a>
           <a
-            className='nav-cta ghost'
-            href={REPO_RELEASES}
-            aria-label={headerCopy.downloadAria}
-            title={headerCopy.downloadTitle}
-            {...ext}
-          >
-            {headerCopy.download}
-          </a>
-          <a
-            className='nav-cta'
+            className='nav-cta ghost is-star'
             href={REPO}
             aria-label={headerCopy.starAria}
             title={headerCopy.starTitle}
@@ -336,6 +327,17 @@ export function Header({
           >
             {headerCopy.starPrefix} ·{' '}
             <span data-github-stars>{github?.starsLabel ?? '40K+'}</span>
+          </a>
+          <a
+            className='nav-cta is-download'
+            href={REPO_RELEASES}
+            aria-label={headerCopy.downloadAria}
+            title={headerCopy.downloadTitle}
+            data-download-cta
+            {...ext}
+          >
+            {headerCopy.download}
+            <span className='download-arch' data-download-arch hidden />
           </a>
           <span className='status-dot' aria-hidden='true' />
         </div>
