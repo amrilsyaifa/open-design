@@ -36,10 +36,11 @@ Defaults:
 - Node heap cap: `--max-old-space-size=192`
 - Compose memory cap: `384m` (`OPEN_DESIGN_MEM_LIMIT=256m` to override)
 
-Do not publish the daemon directly on a public or shared LAN interface. The API is
-unauthenticated for non-browser clients, so remote deployments should keep Compose
-bound to localhost and put an authenticated reverse proxy, SSH tunnel, or VPN in
-front of it.
+Do not publish the daemon directly on a public or shared LAN interface. Same-host
+browser sessions are trusted implicitly (loopback bypass); remote deployments must
+keep Compose bound to localhost and put an authenticated reverse proxy, SSH tunnel,
+or VPN in front of it. All non-loopback programmatic clients must send
+`Authorization: Bearer <OD_API_TOKEN>` with every request.
 
 When exposing the service through an authenticated public IP, domain, or reverse
 proxy, set `OPEN_DESIGN_ALLOWED_ORIGINS` to the browser origins that should be
@@ -71,6 +72,27 @@ ignored. Use this only for trusted, single-user deployments. It lets Codex run
 without the workspace-write sandbox, which is useful when the container host
 blocks unprivileged user namespaces, but it gives the Codex process broader
 filesystem access inside the container.
+
+## Troubleshooting
+
+### 401 Unauthorized on all browser API calls
+
+**Symptom:** The web UI loads at `http://localhost:7456` but every API call (including
+`/api/version`) returns `401 API_TOKEN_REQUIRED`.
+
+**Cause:** Docker NAT. When Docker forwards host port `127.0.0.1:7456` to the
+container, the daemon sees the Docker bridge gateway address (e.g. `172.17.0.1`) as
+the TCP peer — not `127.0.0.1`. The daemon's loopback bypass checks the peer address,
+so it does not fire, and the browser UI (which never sends a Bearer token) gets 401.
+
+**Fix:** Build the image from the current source tree, which contains the
+`isLoopbackBrowserRequest` fix (falls back to checking the HTTP `Host` header when the
+TCP peer address is not loopback):
+
+```bash
+docker compose build
+docker compose up -d
+```
 
 ## Publish to Docker Hub
 

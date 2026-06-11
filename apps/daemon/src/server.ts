@@ -3354,6 +3354,25 @@ function isLoopbackPeerAddress(address) {
   return false;
 }
 
+// Docker NAT changes the TCP peer address from 127.0.0.1 to the bridge
+// gateway (e.g. 172.17.0.1), breaking isLoopbackPeerAddress for Docker
+// deployments. This helper checks the HTTP Host and Origin headers instead:
+// both must resolve to loopback. Requiring Origin to be loopback (when
+// present) blocks DNS-rebinding attacks and prevents reverse-proxy
+// deployments with OD_ALLOWED_ORIGINS from accidentally bypassing Bearer auth.
+export function isLoopbackBrowserRequest(req: { get(name: string): string | undefined }): boolean {
+  const rawHost = req.get('host') ?? '';
+  const hostname = rawHost.replace(/:\d+$/, '');
+  if (!isLoopbackHostname(hostname)) return false;
+  const origin = req.get('origin');
+  if (!origin) return true;
+  try {
+    return isLoopbackHostname(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
 const PROJECT_PREVIEW_SCOPE_TTL_MS = 60 * 60 * 1000;
 const PROJECT_PREVIEW_ASSET_PATH_RE = /^\/projects\/([^/]+)\/preview\/([^/]+)\/.+$/u;
 
@@ -4651,11 +4670,12 @@ export async function startServer({
           return next();
         }
       }
-      // Loopback short-circuit. We ignore the proxied X-Forwarded-For
-      // header here because a reverse proxy MUST always forward the
-      // bearer; the loopback bypass exists for the localhost desktop
-      // UI which has no proxy in the path.
-      if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
+      // Loopback short-circuit. We check both TCP peer address (direct
+      // connections: desktop UI, local CLI) and HTTP Host/Origin headers
+      // (Docker-NAT connections: peer address is the bridge gateway, not
+      // 127.0.0.1). A reverse proxy MUST always forward the bearer; the
+      // loopback bypass is only for localhost desktop/Docker UI flows.
+      if (isLoopbackPeerAddress(req.socket?.remoteAddress) || isLoopbackBrowserRequest(req)) return next();
       const auth = req.get('authorization') ?? '';
       const match = /^Bearer\s+(\S+)\s*$/i.exec(auth);
       if (!match || match[1] !== apiToken) {
