@@ -1460,10 +1460,18 @@ export function resolveStaticSpaFallbackPath(req, staticDir) {
   return indexPath;
 }
 
-export function registerStaticSpaFallback(app, staticDir) {
+export function registerStaticSpaFallback(app, staticDir, sessionToken?: string) {
   app.get('/*splat', (req, res, next) => {
     const indexPath = resolveStaticSpaFallbackPath(req, staticDir);
     if (indexPath == null) return next();
+    if (sessionToken) {
+      // Set an httpOnly session cookie so the browser includes it on every
+      // /api/* request.  Docker-NAT changes the TCP peer to the bridge
+      // gateway so the loopback bypass never fires; the cookie is the
+      // unforgeable trust signal the auth middleware checks instead.
+      // SameSite=Strict blocks cross-site use; HttpOnly blocks JS exfiltration.
+      res.setHeader('Set-Cookie', `od-session=${sessionToken}; Path=/; SameSite=Strict; HttpOnly`);
+    }
     res.sendFile(indexPath);
   });
 }
@@ -3354,24 +3362,6 @@ function isLoopbackPeerAddress(address) {
   return false;
 }
 
-// Docker NAT changes the TCP peer address from 127.0.0.1 to the bridge
-// gateway (e.g. 172.17.0.1), breaking isLoopbackPeerAddress for Docker
-// deployments. This helper checks the HTTP Host and Origin headers instead:
-// both must resolve to loopback. Requiring Origin to be loopback (when
-// present) blocks DNS-rebinding attacks and prevents reverse-proxy
-// deployments with OD_ALLOWED_ORIGINS from accidentally bypassing Bearer auth.
-export function isLoopbackBrowserRequest(req: { get(name: string): string | undefined }): boolean {
-  const rawHost = req.get('host') ?? '';
-  const hostname = rawHost.replace(/:\d+$/, '');
-  if (!isLoopbackHostname(hostname)) return false;
-  const origin = req.get('origin');
-  if (!origin) return true;
-  try {
-    return isLoopbackHostname(new URL(origin).hostname);
-  } catch {
-    return false;
-  }
-}
 
 const PROJECT_PREVIEW_SCOPE_TTL_MS = 60 * 60 * 1000;
 const PROJECT_PREVIEW_ASSET_PATH_RE = /^\/projects\/([^/]+)\/preview\/([^/]+)\/.+$/u;
@@ -4633,6 +4623,12 @@ export async function startServer({
       `(Loopback hosts 127.0.0.1 / ::1 / localhost do not need a token.)`,
     );
   }
+  // Per-startup web session token, distinct from OD_API_TOKEN. When auth is
+  // active the daemon injects this into the served index.html so the browser
+  // can authenticate API calls without the operator exposing OD_API_TOKEN to
+  // front-end code. Docker-NAT flows use this path because the TCP peer is the
+  // bridge gateway rather than 127.0.0.1, so the loopback bypass never fires.
+  const webSessionToken = apiToken.length > 0 ? randomUUID() : '';
 
   const app = express();
   installRouteRegistrationGuard(app);
@@ -4670,12 +4666,17 @@ export async function startServer({
           return next();
         }
       }
-      // Loopback short-circuit. We check both TCP peer address (direct
-      // connections: desktop UI, local CLI) and HTTP Host/Origin headers
-      // (Docker-NAT connections: peer address is the bridge gateway, not
-      // 127.0.0.1). A reverse proxy MUST always forward the bearer; the
-      // loopback bypass is only for localhost desktop/Docker UI flows.
-      if (isLoopbackPeerAddress(req.socket?.remoteAddress) || isLoopbackBrowserRequest(req)) return next();
+      // Loopback short-circuit: desktop UI and local CLI connect directly from
+      // 127.x/::1 so they never need a bearer.
+      if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
+      // Session cookie: set on the HTML response served to the browser.
+      // Docker-NAT changes the TCP peer to the bridge gateway so the loopback
+      // bypass above never fires; the cookie is the unforgeable trust signal
+      // for Docker browser flows. SameSite=Strict prevents cross-site use.
+      // Host headers are NOT checked — they are forgeable by any HTTP client.
+      const cookieHeader = req.get('cookie') ?? '';
+      const sessionCookie = /(?:^|;\s*)od-session=([^;]+)/.exec(cookieHeader)?.[1];
+      if (webSessionToken && sessionCookie === webSessionToken) return next();
       const auth = req.get('authorization') ?? '';
       const match = /^Bearer\s+(\S+)\s*$/i.exec(auth);
       if (!match || match[1] !== apiToken) {
@@ -15431,7 +15432,7 @@ export async function startServer({
     telemetry: { reportFinalizedMessage, reportFeedback },
   });
 
-  registerStaticSpaFallback(app, STATIC_DIR);
+  registerStaticSpaFallback(app, STATIC_DIR, webSessionToken || undefined);
 
   // Wait for `listen` to bind so callers always see the resolved URL —
   // critical when port=0 (ephemeral port) and when the embedding sidecar
