@@ -1,11 +1,12 @@
 // Plan §3.K1 / spec §15.7 — bound-API-token guard.
 //
 // Two halves:
-//   1. The daemon refuses to start with OD_BIND_HOST=0.0.0.0 when no
-//      OD_API_TOKEN is set.
-//   2. When OD_API_TOKEN is set, every /api/* request from a non-loopback
-//      peer must carry `Authorization: Bearer <OD_API_TOKEN>` or a valid
-//      od-session cookie. The health/readiness/version probes stay open.
+//   1. The daemon refuses to start with OD_BIND_HOST=0.0.0.0 when neither
+//      OD_API_TOKEN nor OD_TRUST_PORT_BINDING=1 is set.
+//   2. When OD_API_TOKEN is set (and OD_TRUST_PORT_BINDING is not), every
+//      /api/* request from a non-loopback peer must carry
+//      `Authorization: Bearer <OD_API_TOKEN>`. The health/readiness/version
+//      probes stay open.
 //
 // Includes a Host-header spoofing regression: a non-loopback peer that
 // forges `Host: localhost` must still receive 401 (Host is never trusted).
@@ -23,8 +24,9 @@ function getLanIp(): string | undefined {
   }
 }
 
-const PREVIOUS_TOKEN = process.env.OD_API_TOKEN;
-const PREVIOUS_HOST  = process.env.OD_BIND_HOST;
+const PREVIOUS_TOKEN         = process.env.OD_API_TOKEN;
+const PREVIOUS_HOST          = process.env.OD_BIND_HOST;
+const PREVIOUS_TRUST_BINDING = process.env.OD_TRUST_PORT_BINDING;
 
 let server: http.Server | undefined;
 let baseUrl = '';
@@ -39,11 +41,14 @@ afterEach(async () => {
   else process.env.OD_API_TOKEN = PREVIOUS_TOKEN;
   if (PREVIOUS_HOST === undefined) delete process.env.OD_BIND_HOST;
   else process.env.OD_BIND_HOST = PREVIOUS_HOST;
+  if (PREVIOUS_TRUST_BINDING === undefined) delete process.env.OD_TRUST_PORT_BINDING;
+  else process.env.OD_TRUST_PORT_BINDING = PREVIOUS_TRUST_BINDING;
 });
 
 describe('bound-API-token guard', () => {
-  it('refuses to start with OD_BIND_HOST=0.0.0.0 when OD_API_TOKEN is unset', async () => {
+  it('refuses to start with OD_BIND_HOST=0.0.0.0 when OD_API_TOKEN is unset and OD_TRUST_PORT_BINDING is not set', async () => {
     delete process.env.OD_API_TOKEN;
+    delete process.env.OD_TRUST_PORT_BINDING;
     await expect(startServer({ port: 0, host: '0.0.0.0', returnServer: true }))
       .rejects.toThrow(/OD_API_TOKEN/);
   });

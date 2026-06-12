@@ -1460,18 +1460,10 @@ export function resolveStaticSpaFallbackPath(req, staticDir) {
   return indexPath;
 }
 
-export function registerStaticSpaFallback(app, staticDir, sessionToken?: string) {
+export function registerStaticSpaFallback(app, staticDir) {
   app.get('/*splat', (req, res, next) => {
     const indexPath = resolveStaticSpaFallbackPath(req, staticDir);
     if (indexPath == null) return next();
-    if (sessionToken) {
-      // Set an httpOnly session cookie so the browser includes it on every
-      // /api/* request.  Docker-NAT changes the TCP peer to the bridge
-      // gateway so the loopback bypass never fires; the cookie is the
-      // unforgeable trust signal the auth middleware checks instead.
-      // SameSite=Strict blocks cross-site use; HttpOnly blocks JS exfiltration.
-      res.setHeader('Set-Cookie', `od-session=${sessionToken}; Path=/; SameSite=Strict; HttpOnly`);
-    }
     res.sendFile(indexPath);
   });
 }
@@ -4605,30 +4597,28 @@ export async function startServer({
 
   // Plan §3.K1 / spec §15.7 — bound-API-token guard.
   //
-  // The daemon refuses to bind to a public interface unless an
-  // OD_API_TOKEN is set. This is the spec §16 Phase 5 safety floor:
-  // a hosted operator can no longer accidentally publish an unsecured
-  // daemon by setting OD_BIND_HOST=0.0.0.0 without a token.
+  // The daemon refuses to bind to a public interface unless OD_API_TOKEN is
+  // set OR OD_TRUST_PORT_BINDING=1 is explicitly set by the operator.
   //
-  // Loopback hosts (127.0.0.1 / ::1 / localhost) are always allowed —
-  // the desktop / dev flow remains unchanged. Setting OD_API_TOKEN is
-  // purely additive: when present, every /api/* request must carry a
-  // matching `Authorization: Bearer <token>` header (loopback origins
-  // are exempted so the desktop UI keeps working).
+  // OD_TRUST_PORT_BINDING=1 is for container / reverse-proxy deployments where
+  // port-level access control is enforced outside the daemon (e.g. Docker
+  // Compose binding the host-side port to 127.0.0.1 only). When active, the
+  // daemon trusts every incoming connection regardless of its TCP peer address
+  // — the security boundary is the container orchestration layer, not HTTP auth.
+  //
+  // Loopback hosts (127.0.0.1 / ::1 / localhost) are always allowed without
+  // a token — the desktop / dev flow remains unchanged.
   const apiToken = (process.env.OD_API_TOKEN ?? '').trim();
-  if (!isLoopbackHostname(host) && apiToken.length === 0) {
+  const trustPortBinding = (process.env.OD_TRUST_PORT_BINDING ?? '').trim() === '1';
+  if (!isLoopbackHostname(host) && apiToken.length === 0 && !trustPortBinding) {
     throw new Error(
-      `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set. ` +
-      `Generate one with \`openssl rand -hex 32\` and re-launch. ` +
+      `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set (or ` +
+      `OD_TRUST_PORT_BINDING=1 when port-level security is enforced externally, ` +
+      `e.g. via Docker Compose host-port binding). ` +
+      `Generate OD_API_TOKEN with \`openssl rand -hex 32\` and re-launch. ` +
       `(Loopback hosts 127.0.0.1 / ::1 / localhost do not need a token.)`,
     );
   }
-  // Per-startup web session token, distinct from OD_API_TOKEN. When auth is
-  // active the daemon injects this into the served index.html so the browser
-  // can authenticate API calls without the operator exposing OD_API_TOKEN to
-  // front-end code. Docker-NAT flows use this path because the TCP peer is the
-  // bridge gateway rather than 127.0.0.1, so the loopback bypass never fires.
-  const webSessionToken = apiToken.length > 0 ? randomUUID() : '';
 
   const app = express();
   installRouteRegistrationGuard(app);
@@ -4637,16 +4627,18 @@ export async function startServer({
 
   // Plan §3.K1 — bearer-token middleware.
   //
-  // Active only when OD_API_TOKEN is set. Loopback origins skip the
-  // check (the desktop UI / local CLI never carry a bearer); every
-  // other request must present `Authorization: Bearer <token>` with a
-  // value matching `OD_API_TOKEN`. Health / readiness / version remain
-  // open so monitoring probes don't need the token. Server-minted
-  // project preview asset scopes are also accepted for GETs so sandboxed
-  // browser iframes can load HTML/CSS/JS without privileged headers.
-  // Rich daemon status stays authenticated because it includes local
-  // runtime paths.
-  if (apiToken.length > 0) {
+  // Active only when OD_API_TOKEN is set and OD_TRUST_PORT_BINDING is not.
+  // Loopback origins skip the check (the desktop UI / local CLI never carry a
+  // bearer); every other request must present `Authorization: Bearer <token>`
+  // with a value matching `OD_API_TOKEN`. Health / readiness / version remain
+  // open so monitoring probes don't need the token. Server-minted project
+  // preview asset scopes are also accepted for GETs so sandboxed browser iframes
+  // can load HTML/CSS/JS without privileged headers. Rich daemon status stays
+  // authenticated because it includes local runtime paths.
+  //
+  // Host headers are NOT checked for auth bypass — they are forgeable by any
+  // HTTP client.
+  if (apiToken.length > 0 && !trustPortBinding) {
     const openProbePaths = new Set([
       '/health',
       '/api/health',
@@ -4669,14 +4661,6 @@ export async function startServer({
       // Loopback short-circuit: desktop UI and local CLI connect directly from
       // 127.x/::1 so they never need a bearer.
       if (isLoopbackPeerAddress(req.socket?.remoteAddress)) return next();
-      // Session cookie: set on the HTML response served to the browser.
-      // Docker-NAT changes the TCP peer to the bridge gateway so the loopback
-      // bypass above never fires; the cookie is the unforgeable trust signal
-      // for Docker browser flows. SameSite=Strict prevents cross-site use.
-      // Host headers are NOT checked — they are forgeable by any HTTP client.
-      const cookieHeader = req.get('cookie') ?? '';
-      const sessionCookie = /(?:^|;\s*)od-session=([^;]+)/.exec(cookieHeader)?.[1];
-      if (webSessionToken && sessionCookie === webSessionToken) return next();
       const auth = req.get('authorization') ?? '';
       const match = /^Bearer\s+(\S+)\s*$/i.exec(auth);
       if (!match || match[1] !== apiToken) {
@@ -15432,7 +15416,7 @@ export async function startServer({
     telemetry: { reportFinalizedMessage, reportFeedback },
   });
 
-  registerStaticSpaFallback(app, STATIC_DIR, webSessionToken || undefined);
+  registerStaticSpaFallback(app, STATIC_DIR);
 
   // Wait for `listen` to bind so callers always see the resolved URL —
   // critical when port=0 (ephemeral port) and when the embedding sidecar

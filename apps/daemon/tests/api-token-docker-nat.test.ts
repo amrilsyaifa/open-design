@@ -1,41 +1,45 @@
-// Docker-NAT auth fix — httpOnly session cookie path.
+// Docker-NAT auth fix — OD_TRUST_PORT_BINDING path.
 //
 // In Docker the TCP peer of every browser request is the bridge gateway
 // (e.g. 172.17.0.1) rather than 127.0.0.1, so the existing loopback bypass
-// never fires.  The fix: the daemon sets an httpOnly `od-session` cookie on
-// every index.html response, and the auth middleware accepts it as a valid
-// credential alongside OD_API_TOKEN.  The browser includes the cookie
-// automatically on all /api/* requests — no client code changes needed.
+// never fires.  The fix: docker-compose.yml sets OD_TRUST_PORT_BINDING=1 which
+// tells the daemon that port-level access control is enforced by the container
+// orchestration layer (the host-side port is bound to 127.0.0.1 only).  When
+// OD_TRUST_PORT_BINDING=1 the daemon trusts ALL connections regardless of TCP
+// peer address and does not install a bearer-token middleware.
 //
 // Security properties:
-//   - SameSite=Strict: cross-site requests cannot include the cookie.
-//   - HttpOnly: JavaScript cannot read or forge the cookie value.
-//   - The token value is a per-startup randomUUID(); a remote attacker who
-//     cannot load the daemon's HTML cannot guess or obtain the value.
+//   - The trust decision is explicit and operator-supplied, not inferred from
+//     any HTTP header or cookie that a remote client could forge or mint.
+//   - A remote attacker who reaches a publicly-bound daemon (i.e. operator
+//     changed the port binding to 0.0.0.0) that still has OD_TRUST_PORT_BINDING=1
+//     would have full access — this is intentional: the env var is a clear
+//     statement that the operator trusts their own network boundary.
+//   - The od-session cookie path has been removed entirely: no cookie is set on
+//     HTML responses, and no cookie is accepted by the auth middleware. A remote
+//     client that crafts an od-session cookie value is rejected with 401.
 //   - Host headers are never trusted for auth bypass (Host is forgeable).
 
 import type http from 'node:http';
+import { networkInterfaces } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { startServer } from '../src/server.js';
 
-const PREVIOUS_TOKEN = process.env.OD_API_TOKEN;
-const PREVIOUS_HOST  = process.env.OD_BIND_HOST;
+function getLanIp(): string | undefined {
+  for (const ifaces of Object.values(networkInterfaces())) {
+    for (const iface of ifaces ?? []) {
+      if (!iface.internal && iface.family === 'IPv4') return iface.address;
+    }
+  }
+}
+
+const PREVIOUS_TOKEN         = process.env.OD_API_TOKEN;
+const PREVIOUS_HOST          = process.env.OD_BIND_HOST;
+const PREVIOUS_TRUST_BINDING = process.env.OD_TRUST_PORT_BINDING;
 
 let server: http.Server | undefined;
 let baseUrl = '';
 let shutdown: (() => Promise<void> | void) | undefined;
-
-beforeEach(async () => {
-  process.env.OD_API_TOKEN = 'docker-nat-test-token';
-  const started = (await startServer({ port: 0, host: '127.0.0.1', returnServer: true })) as {
-    url: string;
-    server: http.Server;
-    shutdown?: () => Promise<void> | void;
-  };
-  baseUrl = started.url;
-  server = started.server;
-  shutdown = started.shutdown;
-});
 
 afterEach(async () => {
   if (shutdown) await Promise.resolve(shutdown());
@@ -46,6 +50,8 @@ afterEach(async () => {
   else process.env.OD_API_TOKEN = PREVIOUS_TOKEN;
   if (PREVIOUS_HOST === undefined) delete process.env.OD_BIND_HOST;
   else process.env.OD_BIND_HOST = PREVIOUS_HOST;
+  if (PREVIOUS_TRUST_BINDING === undefined) delete process.env.OD_TRUST_PORT_BINDING;
+  else process.env.OD_TRUST_PORT_BINDING = PREVIOUS_TRUST_BINDING;
 });
 
 describe('Host-spoofing regression guard', () => {
@@ -55,9 +61,17 @@ describe('Host-spoofing regression guard', () => {
   });
 
   it('loopback TCP peer still bypasses auth without any token (desktop / dev flow unchanged)', async () => {
-    // In tests the client is on 127.0.0.1 → TCP loopback bypass fires → 200
-    // even when a forged Host header is present. This proves the TCP check is
-    // still the only bypass path for direct connections.
+    process.env.OD_API_TOKEN = 'test-loopback-token';
+    const started = (await startServer({ port: 0, host: '127.0.0.1', returnServer: true })) as {
+      url: string;
+      server: http.Server;
+      shutdown?: () => Promise<void> | void;
+    };
+    baseUrl = started.url;
+    server = started.server;
+    shutdown = started.shutdown;
+
+    // 127.0.0.1 TCP peer → loopback bypass fires → 200 even with forged Host header
     const resp = await fetch(`${baseUrl}/api/plugins`, {
       headers: { Host: 'localhost:7456' },
     });
@@ -65,50 +79,94 @@ describe('Host-spoofing regression guard', () => {
   });
 });
 
-describe('session cookie acceptance', () => {
-  it('accepts OD_API_TOKEN as Bearer', async () => {
-    const resp = await fetch(`${baseUrl}/api/plugins`, {
-      headers: { Authorization: 'Bearer docker-nat-test-token' },
-    });
-    expect(resp.status).toBe(200);
+describe('cookie regression', () => {
+  it('GET / does not set an od-session cookie (cookie path removed)', async () => {
+    // The previous (insecure) approach set an od-session cookie on every HTML
+    // response, allowing any client that could reach GET / to mint a bearer-
+    // equivalent credential. This test confirms the cookie is never issued.
+    process.env.OD_API_TOKEN = 'cookie-regression-token';
+    const started = (await startServer({ port: 0, host: '127.0.0.1', returnServer: true })) as {
+      url: string;
+      server: http.Server;
+      shutdown?: () => Promise<void> | void;
+    };
+    server = started.server;
+    shutdown = started.shutdown;
+    baseUrl = started.url;
+
+    const resp = await fetch(`${baseUrl}/`);
+    // No od-session cookie must be set
+    const setCookie = resp.headers.get('set-cookie') ?? '';
+    expect(setCookie).not.toContain('od-session');
   });
 
-  it('accepts the od-session cookie as a valid credential', async () => {
-    // Simulate the Docker browser flow: load the page first (which sets the
-    // cookie), then use that cookie for API requests.
-    // Since STATIC_DIR has no index.html in tests, we simulate by reading the
-    // session token from a signed-in request and setting the cookie manually.
-    // The auth middleware accepts any valid od-session value that matches the
-    // per-startup webSessionToken; we probe with OD_API_TOKEN first to learn
-    // the actual token value, then validate the cookie path.
-    //
-    // Real Docker flow: browser loads http://localhost:7456 → daemon sets
-    // Set-Cookie: od-session=<token> → browser sends cookie on /api/* → 200.
-    //
-    // We cannot read webSessionToken directly from the started server, so we
-    // confirm the mechanism indirectly: a wrong cookie value → 401 (non-loopback
-    // peers only; in tests TCP bypass fires so we assert loopback behavior).
-    const wrongCookieResp = await fetch(`${baseUrl}/api/plugins`, {
-      headers: { Cookie: 'od-session=wrong-cookie-value' },
-    });
-    // From loopback TCP peer the TCP bypass fires before cookie check → 200.
-    // This confirms the TCP bypass is intact and cookies are an ADDITIVE path
-    // for non-loopback peers, not a replacement for the TCP check.
-    expect(wrongCookieResp.status).toBe(200);
-  });
+  it('non-loopback peer with a crafted od-session cookie still gets 401', async () => {
+    // This is the exact attack the previous cookie fix introduced:
+    //   1. Remote client GET / (no auth) → old code would set Set-Cookie: od-session=<uuid>
+    //   2. Remote client replays cookie on /api/* → old code granted access
+    // With the cookie path removed, a crafted cookie is simply ignored.
+    const lanIp = getLanIp();
+    if (!lanIp) {
+      console.log('    (skipped — no non-loopback interface found)');
+      return;
+    }
+
+    const prev = process.env.OD_API_TOKEN;
+    process.env.OD_API_TOKEN = 'cookie-replay-test-token';
+    let srv: http.Server | undefined;
+    let shut: (() => Promise<void> | void) | undefined;
+    try {
+      const started = (await startServer({ port: 0, host: '0.0.0.0', returnServer: true })) as {
+        url: string;
+        server: http.Server;
+        shutdown?: () => Promise<void> | void;
+      };
+      srv = started.server;
+      shut = started.shutdown;
+      const port = (srv.address() as { port: number }).port;
+
+      // Simulate: attacker crafts an od-session cookie and replays it
+      const resp = await fetch(`http://${lanIp}:${port}/api/plugins`, {
+        headers: { Cookie: 'od-session=attacker-crafted-value' },
+      });
+      expect(resp.status).toBe(401);
+    } finally {
+      if (shut) await Promise.resolve(shut());
+      if (srv) await new Promise<void>((r) => srv!.close(() => r()));
+      if (prev === undefined) delete process.env.OD_API_TOKEN;
+      else process.env.OD_API_TOKEN = prev;
+    }
+  }, 30_000);
 });
 
-describe('cookie security properties', () => {
-  it('does not expose session token in response body or headers', async () => {
-    // The session token must never appear in a non-cookie response header or
-    // in the JSON body of any API response.
+describe('OD_TRUST_PORT_BINDING', () => {
+  it('allows daemon to start on 0.0.0.0 without OD_API_TOKEN', async () => {
+    delete process.env.OD_API_TOKEN;
+    process.env.OD_TRUST_PORT_BINDING = '1';
+    const started = (await startServer({ port: 0, host: '0.0.0.0', returnServer: true })) as {
+      url: string;
+      server: http.Server;
+      shutdown?: () => Promise<void> | void;
+    };
+    server = started.server;
+    shutdown = started.shutdown;
+    baseUrl = started.url;
+    expect(baseUrl).toMatch(/^http:\/\//);
+  });
+
+  it('accepts all connections without a bearer token when active', async () => {
+    delete process.env.OD_API_TOKEN;
+    process.env.OD_TRUST_PORT_BINDING = '1';
+    const started = (await startServer({ port: 0, host: '127.0.0.1', returnServer: true })) as {
+      url: string;
+      server: http.Server;
+      shutdown?: () => Promise<void> | void;
+    };
+    server = started.server;
+    shutdown = started.shutdown;
+    baseUrl = started.url;
+
     const resp = await fetch(`${baseUrl}/api/plugins`);
-    const body = await resp.text();
-    // The token itself is a UUID; we just verify the response is not leaking
-    // an od-session value in the body or a non-Set-Cookie header.
-    expect(resp.headers.get('x-od-session')).toBeNull();
-    expect(resp.headers.get('od-session')).toBeNull();
-    // Body should be the plugins list JSON, not a token disclosure
-    expect(body).not.toMatch(/od-session/);
+    expect(resp.status).toBe(200);
   });
 });
